@@ -1,0 +1,369 @@
+# fsd_sim_prototype.py
+"""
+FSD-Simulation Prototype (RESEARCH ONLY)
+---------------------------------------
+IMPORTANT:
+- This code is expressly for simulation / research / algorithm development.
+- DO NOT USE THIS CODE TO CONTROL REAL VEHICLES.
+- The system lacks hardware redundancy, certification, safety-critical verification.
+- Before any physical test, extensive verification, formal methods, and certified controllers are REQUIRED.
+
+Features:
+- Correct CNN -> patch -> Transformer BEV pipeline (batch & shape-safe)
+- Simple LoRA adapter applied to Transformer feed-forward (demo)
+- Temporal encoder for multiple frames
+- Shadow action head (bounded outputs), with safety filter hooks
+- Simulation data loader stub & training loop skeleton
+"""
+
+import math, time, random, os
+from typing import List, Tuple, Dict
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+# --------------------------
+# Utility: LoRA adapter (simple)
+# --------------------------
+class LoRA(nn.Module):
+    """
+    Minimal LoRA block: A + (B @ C) scaled by alpha/rank
+    Inserted into a weight's forward path as an additive low-rank update.
+    This is a research convenience — production LoRA libs have more features.
+    """
+    def __init__(self, in_features, out_features, r=8, alpha=16.0):
+        super().__init__()
+        self.r = r
+        self.alpha = alpha
+        if r > 0:
+            self.A = nn.Parameter(torch.zeros((r, in_features)))
+            self.B = nn.Parameter(torch.zeros((out_features, r)))
+            # init small
+            nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
+            nn.init.zeros_(self.B)
+            self.scaling = alpha / r
+        else:
+            # disabled
+            self.register_parameter('A', None)
+            self.register_parameter('B', None)
+            self.scaling = 1.0
+
+    def forward(self, x):
+        # x: (..., in_features)
+        if self.r == 0:
+            return 0.0
+        # compute (x @ A.T) -> (..., r), then @ B.T -> (..., out_features)
+        # Use einsum for generality
+        low = torch.einsum('...d,rd->...r', x, self.A)  # (..., r)
+        out = torch.einsum('...r,or->...o', low, self.B)  # (..., out_features)
+        return out * self.scaling
+
+# --------------------------
+# Visual encoder: small CNN -> patch projection
+# --------------------------
+class SmallCNNBackbone(nn.Module):
+    def __init__(self, in_ch=3, base_channels=64):
+        super().__init__()
+        # Example light-weight backbone
+        self.conv1 = nn.Conv2d(in_ch, base_channels, kernel_size=7, stride=2, padding=3)
+        self.bn1 = nn.BatchNorm2d(base_channels)
+        self.conv2 = nn.Conv2d(base_channels, base_channels*2, kernel_size=3, stride=2, padding=1)
+        self.bn2 = nn.BatchNorm2d(base_channels*2)
+        self.conv3 = nn.Conv2d(base_channels*2, base_channels*4, kernel_size=3, stride=2, padding=1)
+        self.bn3 = nn.BatchNorm2d(base_channels*4)
+        self.out_dim = base_channels*4
+
+    def forward(self, x):
+        # x: (B,3,H,W)
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+        return x  # (B, C, H', W')
+
+# --------------------------
+# Patchify + linear projection to tokens
+# --------------------------
+class Patchify(nn.Module):
+    def __init__(self, in_channels, patch_size=(1,1), proj_dim=256):
+        super().__init__()
+        self.patch_h, self.patch_w = patch_size
+        self.proj = nn.Linear(in_channels * self.patch_h * self.patch_w, proj_dim)
+        self.proj_dim = proj_dim
+
+    def forward(self, feat_map):
+        # feat_map: (B, C, H, W)
+        B, C, H, W = feat_map.shape
+        ph, pw = self.patch_h, self.patch_w
+        assert H % ph == 0 and W % pw == 0, "feat_map size must be divisible by patch size"
+        Hn, Wn = H // ph, W // pw
+        # reshape to patches
+        patches = feat_map.unfold(2, ph, ph).unfold(3, pw, pw)
+        # patches: (B, C, Hn, Wn, ph, pw)
+        patches = patches.contiguous().view(B, C, Hn*Wn, ph*pw)  # (B, C, S, ph*pw)
+        patches = patches.permute(0,2,1,3).contiguous()  # (B, S, C, ph*pw)
+        patches = patches.view(B, Hn*Wn, C*ph*pw)  # (B, S, D_in)
+        # project
+        tokens = self.proj(patches)  # (B, S, proj_dim)
+        return tokens  # (B, S, D)
+
+# --------------------------
+# Transformer with optional LoRA on FFN
+# --------------------------
+class TransformerBlockWithLoRA(nn.Module):
+    def __init__(self, dim, nhead=8, dim_ff=2048, dropout=0.1, lora_r=0):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(dim, nhead, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim_ff),
+            nn.GELU(),
+            nn.Linear(dim_ff, dim)
+        )
+        # LoRA adapter applied to ffn's second linear as additive update
+        self.lora = LoRA(in_features=dim_ff, out_features=dim, r=lora_r, alpha=16.0) if lora_r>0 else None
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, attn_mask=None):
+        # x: (B, S, D)
+        # Self-attn
+        attn_out, _ = self.self_attn(x, x, x, attn_mask=attn_mask, need_weights=False)
+        x = x + self.dropout(attn_out)
+        x = self.norm1(x)
+        # FFN
+        f = self.ffn(x)  # (B, S, D)
+        if self.lora is not None:
+            # compute lora add-on: we want shape (B,S,D), so feed the hidden pre-nonlinearity?
+            # Simpler: pass through ffn[0] output to LoRA and add
+            hidden = self.ffn[0](x)  # (B,S,dim_ff)
+            lora_add = self.lora(hidden)  # (B,S,D)
+            f = f + lora_add
+        x = x + self.dropout(f)
+        x = self.norm2(x)
+        return x
+
+# --------------------------
+# Temporal aggregator (causal)
+# --------------------------
+class TemporalEncoder(nn.Module):
+    def __init__(self, token_dim, n_layers=2, nhead=8, lora_r=0):
+        super().__init__()
+        layers = []
+        for _ in range(n_layers):
+            layers.append(TransformerBlockWithLoRA(token_dim, nhead=nhead, dim_ff=token_dim*4, lora_r=lora_r))
+        self.layers = nn.ModuleList(layers)
+
+    def forward(self, x_seq):
+        # x_seq: (B, T, S, D)  T = temporal frames, S = spatial tokens
+        B, T, S, D = x_seq.shape
+        # flatten temporal+spatial into sequence for a transformer with causal mask
+        seq = x_seq.view(B, T*S, D)  # (B, TS, D)
+        # causal mask to prevent future frame attending to future tokens
+        # allow tokens at time t to attend to <= t tokens.
+        device = seq.device
+        TS = T*S
+        mask = torch.ones((TS, TS), device=device).triu(1)  # upper triangular: disallow future
+        mask = mask.bool()
+        # apply blocks
+        out = seq
+        for blk in self.layers:
+            out = blk(out, attn_mask=mask)
+        out = out.view(B, T, S, D)
+        # return aggregated per-frame representation (e.g., take last time)
+        return out  # (B, T, S, D)
+
+# --------------------------
+# BEV Head & Action Head
+# --------------------------
+class BEVDecoder(nn.Module):
+    def __init__(self, token_dim, bev_H, bev_W, out_dim=1024):
+        super().__init__()
+        self.token_dim = token_dim
+        self.bev_H = bev_H
+        self.bev_W = bev_W
+        self.out_dim = out_dim
+        # simple MLP to get BEV grid features
+        self.proj = nn.Linear(token_dim, out_dim)
+        # optionally follow with conv to spatialize
+        self.conv = nn.Sequential(
+            nn.Conv2d(out_dim, out_dim, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(out_dim, out_dim, 3, padding=1),
+            nn.ReLU()
+        )
+
+    def forward(self, tokens): 
+        # tokens: (B, S, D) where S == bev_H*bev_W
+        B, S, D = tokens.shape
+        x = self.proj(tokens)  # (B, S, out_dim)
+        x = x.permute(0,2,1).contiguous().view(B, self.out_dim, self.bev_H, self.bev_W)
+        x = self.conv(x)
+        return x  # (B, out_dim, H, W)
+
+class ShadowActionHead(nn.Module):
+    def __init__(self, bev_channels, bev_H, bev_W, action_dim=4):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d((1,1))
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(bev_channels, 256),
+            nn.ReLU(),
+            nn.Linear(256, action_dim)
+        )
+
+    def forward(self, bev_feat):
+        # bev_feat: (B, C, H, W)
+        x = self.pool(bev_feat)  # (B, C, 1,1)
+        x = self.fc(x)  # (B, action_dim)
+        # tanh to bound between -1 and 1 (normalized suggestions)
+        return torch.tanh(x)
+
+# --------------------------
+# Full Model: puts pieces together
+# --------------------------
+class QwenFSDSim(nn.Module):
+    def __init__(self,
+                 in_ch=3,
+                 base_channels=64,
+                 patch_size=(1,1),
+                 token_dim=256,
+                 temporal_T=4,
+                 bev_H=16, bev_W=16,
+                 lora_r=4):
+        super().__init__()
+        # Visual backbone
+        self.backbone = SmallCNNBackbone(in_ch=in_ch, base_channels=base_channels)
+        feat_C = self.backbone.out_dim
+        # Patchify: choose patch size so that S ~ bev_H*bev_W
+        self.patchify = Patchify(in_channels=feat_C, patch_size=patch_size, proj_dim=token_dim)
+        # Temporal encoder with LoRA
+        self.temporal = TemporalEncoder(token_dim=token_dim, n_layers=2, nhead=8, lora_r=lora_r)
+        # BEV decoder
+        self.bev_decoder = BEVDecoder(token_dim=token_dim, bev_H=bev_H, bev_W=bev_W, out_dim=1024)
+        # Shadow RL head
+        self.shadow_head = ShadowActionHead(bev_channels=1024, bev_H=bev_H, bev_W=bev_W, action_dim=4)
+
+        # safety filter stub (application MUST implement real filter)
+        self.register_buffer('_safety_dummy', torch.tensor([1.0]))
+
+        # keep track of token/projection dims for debug
+        self.token_dim = token_dim
+        self.temporal_T = temporal_T
+        self.bev_H = bev_H
+        self.bev_W = bev_W
+
+    def forward(self, img_seq, text_tokens=None):
+        """
+        img_seq: (B, T, 3, H, W)  T = temporal frames
+        text_tokens: optional language context (not used in this sim prototype)
+        returns: actions (B, action_dim), bev_feat (B, C, H, W)
+        """
+        B, T, C, H, W = img_seq.shape
+        # process each frame
+        feats = []
+        for t in range(T):
+            f = self.backbone(img_seq[:,t])  # (B, C', H', W')
+            tokens = self.patchify(f)  # (B, S, token_dim)
+            feats.append(tokens)
+        feats = torch.stack(feats, dim=1)  # (B, T, S, D)
+        # temporal fusion
+        fused = self.temporal(feats)  # (B, T, S, D)
+        # pick last frame tokens as current BEV tokens (causal)
+        last_tokens = fused[:, -1, :, :]  # (B, S, D)
+        bev = self.bev_decoder(last_tokens)  # (B, 1024, bev_H, bev_W)
+        actions = self.shadow_head(bev)  # (B, 4) in [-1,1]
+        # safety hook (placeholder)
+        safe_actions = self._apply_safety_filter(actions, bev)
+        return {"actions": safe_actions, "bev": bev, "raw_actions": actions}
+
+    def _apply_safety_filter(self, actions, bev):
+        # Placeholder: real safety logic must be implemented externally.
+        # Example: clip magnitudes, ensure braking override, etc.
+        # For research: provide a clipped, logged output.
+        clipped = torch.clamp(actions, -0.99, 0.99)
+        return clipped
+
+# --------------------------
+# Dummy Dataset & Collate (for simulation data)
+# --------------------------
+class DummySimDataset(Dataset):
+    def __init__(self, num_samples=1000, T=4, H=256, W=256):
+        self.num = num_samples
+        self.T = T
+        self.H = H
+        self.W = W
+
+    def __len__(self):
+        return self.num
+
+    def __getitem__(self, idx):
+        # Random image sequence & placeholder action label
+        seq = (torch.randn(self.T, 3, self.H, self.W) * 0.5 + 0.5).clamp(0,1)
+        # Dummy supervised action: zero vector (research only)
+        action = torch.zeros(4)
+        return {"img_seq": seq, "action": action}
+
+def collate_fn(batch):
+    img_seq = torch.stack([b['img_seq'] for b in batch], dim=0)  # (B,T,3,H,W)
+    action = torch.stack([b['action'] for b in batch], dim=0)
+    return {"img_seq": img_seq, "action": action}
+
+# --------------------------
+# Training skeleton
+# --------------------------
+def train_one_epoch(model, loader, optimizer, device):
+    model.train()
+    total_loss = 0.0
+    for batch in loader:
+        img_seq = batch['img_seq'].to(device)
+        gt_action = batch['action'].to(device)
+        out = model(img_seq)
+        pred = out['actions']  # (B,4)
+        # simple supervised L2 loss (for imitation-style training)
+        loss = F.mse_loss(pred, gt_action)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(loader)
+
+def validate(model, loader, device):
+    model.eval()
+    total_loss = 0.0
+    with torch.no_grad():
+        for batch in loader:
+            img_seq = batch['img_seq'].to(device)
+            gt_action = batch['action'].to(device)
+            out = model(img_seq)
+            loss = F.mse_loss(out['actions'], gt_action)
+            total_loss += loss.item()
+    return total_loss / len(loader)
+
+# --------------------------
+# Example run (simulation-only)
+# --------------------------
+def main():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # hyperparams
+    T = 4
+    H = 256
+    W = 256
+    batch_size = 4
+
+    model = QwenFSDSim(in_ch=3, base_channels=32, patch_size=(1,1), token_dim=128,
+                       temporal_T=T, bev_H=16, bev_W=16, lora_r=4)
+    model.to(device)
+
+    ds = DummySimDataset(num_samples=200, T=T, H=H, W=W)
+    loader = DataLoader(ds, batch_size=batch_size, collate_fn=collate_fn, shuffle=True)
+
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-6)
+    for epoch in range(3):
+        t0 = time.time()
+        tr_loss = train_one_epoch(model, loader, opt, device)
+        val_loss = validate(model, loader, device)
+        print(f"Epoch {epoch} train_loss={tr_loss:.6f} val_loss={val_loss:.6f} time={time.time()-t0:.1f}s")
+
+if __name__ == "__main__":
+    main()
